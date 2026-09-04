@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Project data — the user's own source photos and generated output,
+# not something that belongs in version control.
+images/*
+!images/.gitkeep
+finished-images/*
+!finished-images/.gitkeep

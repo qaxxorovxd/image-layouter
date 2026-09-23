@@ -21,3 +21,5 @@ images/*
 !images/.gitkeep
 finished-images/*
 !finished-images/.gitkeep
+skipped-images/*
+!skipped-images/.gitkeep

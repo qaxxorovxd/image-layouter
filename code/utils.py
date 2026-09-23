@@ -24,5 +24,18 @@ def list_images(directory: Path):
     return files
 
 
+def unique_path(path: Path) -> Path:
+    """Return *path*, or the same name with a -2, -3 ... suffix if it is already taken."""
+    path = Path(path)
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
 def cm_to_px(cm: float, dpi: int) -> int:
     return round(cm / 2.54 * dpi)

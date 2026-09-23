@@ -1,17 +1,23 @@
 """Image Layouter — batch crop photos to a fixed print size (e.g. 10x15 cm).
 
 Workflow:
-  1. Startup dialog asks for the print layout size (cm) and DPI.
+  1. Startup dialog asks for the print layout size (cm), DPI and orientation.
   2. Every image in ./images/ is loaded (natural, numeric-aware order).
-  3. For each photo you position/zoom a crop box matching the layout's
-     aspect ratio with WASD / arrow keys, mouse drag, "1"/"2" or the
-     mouse wheel to zoom.
-  4. Enter, Space or Escape confirms the crop, saves it and moves on.
-  5. After the last photo, all crops have been written to
-     ./finished-images/ as 1.png, 2.png, ... N.png at the exact pixel
-     size for the chosen layout + DPI.
+  3. For each photo either
+       - crop mode: position/zoom a crop box matching the page's aspect ratio
+         with WASD / arrow keys, mouse drag, "1"/"2" or the mouse wheel, or
+       - blur-fit mode ("B"): the whole photo is placed on the page and the
+         leftover paper is filled with a blurred copy of the same photo.
+     "L" lays the paper down (landscape), "P" stands it up (portrait),
+     "K" shows the key list.
+  4. Enter, Space or Escape confirms the page, saves it and moves on;
+     "N" skips the photo instead, setting it aside in ./skipped-images/.
+  5. After the last photo, every saved page is in ./finished-images/ as
+     1.png, 2.png, ... N.png (numbered without gaps, skipped photos do not
+     take a number) at the exact pixel size for the chosen layout + DPI.
 """
 
+import shutil
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
@@ -19,6 +25,7 @@ from pathlib import Path
 from PIL import Image, ImageTk, ImageOps
 
 from . import config as cfg
+from . import render
 from . import utils
 
 
@@ -29,14 +36,30 @@ class CropState:
         self.img_w, self.img_h = img_w, img_h
         self.aspect_ratio = aspect_ratio
 
-        self.max_box_h = min(img_h, img_w / aspect_ratio)
-        self.max_box_w = self.max_box_h * aspect_ratio
-        self.min_box_h = max(10.0, self.max_box_h * cfg.MIN_ZOOM_FRACTION)
-
+        self._recalc_limits()
         self.box_h = self.max_box_h
         self.box_w = self.max_box_w
         self.cx = img_w / 2.0
         self.cy = img_h / 2.0
+
+    def _recalc_limits(self):
+        self.max_box_h = min(self.img_h, self.img_w / self.aspect_ratio)
+        self.max_box_w = self.max_box_h * self.aspect_ratio
+        self.min_box_h = max(10.0, self.max_box_h * cfg.MIN_ZOOM_FRACTION)
+
+    def set_aspect_ratio(self, aspect_ratio):
+        """Switch to a new page shape, keeping the current zoom level and centre point."""
+        if abs(aspect_ratio - self.aspect_ratio) < 1e-9:
+            return
+        zoom_fraction = self.box_h / self.max_box_h
+        fx, fy = self.cx / self.img_w, self.cy / self.img_h
+
+        self.aspect_ratio = aspect_ratio
+        self._recalc_limits()
+        self.box_h = min(max(self.max_box_h * zoom_fraction, self.min_box_h), self.max_box_h)
+        self.box_w = self.box_h * self.aspect_ratio
+        self.cx, self.cy = fx * self.img_w, fy * self.img_h
+        self.clamp_center()
 
     def clamp_center(self):
         half_w, half_h = self.box_w / 2.0, self.box_h / 2.0
@@ -61,12 +84,33 @@ class CropState:
         self.box_w = new_h * self.aspect_ratio
         self.clamp_center()
 
+    def reset(self):
+        self.box_h = self.max_box_h
+        self.box_w = self.max_box_w
+        self.cx = self.img_w / 2.0
+        self.cy = self.img_h / 2.0
+
     def box_px(self):
         x0 = self.cx - self.box_w / 2.0
         y0 = self.cy - self.box_h / 2.0
         x1 = self.cx + self.box_w / 2.0
         y1 = self.cy + self.box_h / 2.0
         return x0, y0, x1, y1
+
+
+KEY_HELP = [
+    ("W A S D / strelkalar", "kesish ramkasini surish"),
+    ("Sichqonchani sudrash", "kesish ramkasini surish"),
+    ("1  /  2", "yaqinlashtirish / uzoqlashtirish"),
+    ("Sichqoncha g'ildiragi", "yaqinlashtirish / uzoqlashtirish"),
+    ("B", "rasm to'liq tushsin — bo'sh joy blur fon bilan to'ladi"),
+    ("P", "qog'ozni tik qo'yish (portret)"),
+    ("L", "qog'ozni yotqizish (landshaft)"),
+    ("N  yoki  Delete", "rasmni o'tkazib yuborish (skipped-images/ ga)"),
+    ("R", "joriy rasm sozlamalarini tiklash"),
+    ("K", "shu klavishlar ro'yxati (yana K — yopish)"),
+    ("Enter / Space / Esc", "saqlash va keyingi rasmga o'tish"),
+]
 
 
 class App:
@@ -79,20 +123,27 @@ class App:
 
         self.images_dir = Path("images")
         self.output_dir = Path("finished-images")
+        self.skipped_dir = Path("skipped-images")
 
         self.dpi = cfg.DEFAULT_DPI
         self.layout_w_cm = cfg.DEFAULT_LAYOUT_W_CM
         self.layout_h_cm = cfg.DEFAULT_LAYOUT_H_CM
+        self.orientation = "portrait"
+        self.blur_fit = cfg.DEFAULT_BLUR_FIT
 
         if not self.ask_layout_size():
             self.root.destroy()
             return
 
-        self.aspect_ratio = self.layout_w_cm / self.layout_h_cm
-        self.target_px = (
-            utils.cm_to_px(self.layout_w_cm, self.dpi),
-            utils.cm_to_px(self.layout_h_cm, self.dpi),
-        )
+        # The entered size is kept as short/long side; orientation decides how it lands.
+        self.short_cm = min(self.layout_w_cm, self.layout_h_cm)
+        self.long_cm = max(self.layout_w_cm, self.layout_h_cm)
+        if cfg.DEFAULT_ORIENTATION in ("portrait", "landscape"):
+            self.orientation = cfg.DEFAULT_ORIENTATION
+        self.aspect_ratio = 1.0
+        self.target_px = (1, 1)
+        self.state = None
+        self._apply_layout(refresh=False)
 
         self.image_paths = utils.list_images(self.images_dir)
         if not self.image_paths:
@@ -105,15 +156,19 @@ class App:
             return
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.skipped_dir.mkdir(parents=True, exist_ok=True)
 
         self.index = 0
         self.total = len(self.image_paths)
+        self.saved_count = 0
+        self.skipped_count = 0
         self.current_pil = None
         self.display_source = None
-        self.state = None
         self.tk_preview = None
         self.preview_scale = 1.0
         self._drag_start = None
+        self._blur_preview = None  # cached composed page for blur-fit mode
+        self._help_window = None
 
         self.build_ui()
         self.load_current_image()
@@ -147,8 +202,14 @@ class App:
         dpi_entry = tk.Entry(dlg, textvariable=dpi_var, width=10)
         dpi_entry.grid(row=3, column=1, padx=14, pady=4, sticky="w")
 
+        blur_var = tk.BooleanVar(value=cfg.DEFAULT_BLUR_FIT)
+        tk.Checkbutton(
+            dlg, variable=blur_var,
+            text="Rasm to'liq tushsin (bo'sh joyga blur fon) — keyin \"B\" bilan almashadi",
+        ).grid(row=4, column=0, columnspan=2, padx=14, pady=(8, 0), sticky="w")
+
         err_label = tk.Label(dlg, text="", fg="red")
-        err_label.grid(row=4, column=0, columnspan=2)
+        err_label.grid(row=5, column=0, columnspan=2)
 
         def confirm(event=None):
             try:
@@ -161,6 +222,8 @@ class App:
                 err_label.config(text="Iltimos, to'g'ri musbat son kiriting.")
                 return
             self.layout_w_cm, self.layout_h_cm, self.dpi = w, h, d
+            self.orientation = "landscape" if w > h else "portrait"
+            self.blur_fit = bool(blur_var.get())
             result["ok"] = True
             dlg.destroy()
 
@@ -168,7 +231,7 @@ class App:
             dlg.destroy()
 
         btn_frame = tk.Frame(dlg)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=14)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=14)
         tk.Button(btn_frame, text="OK", width=10, command=confirm).pack(side="left", padx=6)
         tk.Button(btn_frame, text="Bekor qilish", width=10, command=cancel).pack(side="left", padx=6)
 
@@ -186,13 +249,43 @@ class App:
         self.root.wait_window(dlg)
         return result["ok"]
 
+    # --------------------------------------------------------- page geometry
+    def page_cm(self):
+        """(width, height) of the paper in cm, the way the current orientation lays it out."""
+        if self.orientation == "landscape":
+            return self.long_cm, self.short_cm
+        return self.short_cm, self.long_cm
+
+    def _apply_layout(self, refresh=True):
+        """Recompute aspect ratio / pixel size after an orientation change."""
+        w_cm, h_cm = self.page_cm()
+        self.aspect_ratio = w_cm / h_cm
+        self.target_px = (utils.cm_to_px(w_cm, self.dpi), utils.cm_to_px(h_cm, self.dpi))
+        if refresh:
+            if self.state is not None:
+                self.state.set_aspect_ratio(self.aspect_ratio)
+            self._blur_preview = None
+            self.update_status()
+            self.redraw()
+
+    def set_orientation(self, orientation):
+        if orientation == self.orientation:
+            return
+        self.orientation = orientation
+        self._apply_layout()
+
+    def toggle_blur_fit(self):
+        self.blur_fit = not self.blur_fit
+        self.update_status()
+        self.redraw()
+
     # ------------------------------------------------------------------- UI
     def build_ui(self):
         self.status_var = tk.StringVar()
         self.help_var = tk.StringVar(
             value=(
-                "WASD / strelkalar: joylashtirish   |   1: yaqinlashtirish   2: uzoqlashtirish   |   "
-                "Sichqoncha: bosib surish, g'ildirak: zoom   |   Enter / Space / Esc: saqlash va keyingisi"
+                "WASD: joylashtirish  |  1/2: zoom  |  B: to'liq sig'dirish (blur fon)  |  "
+                "P/L: qog'oz tik / yotiq  |  N: o'tkazib yuborish  |  K: klavishlar  |  Enter: saqlash"
             )
         )
 
@@ -223,11 +316,82 @@ class App:
         self.root.bind("<KeyPress>", self.on_keypress)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ------------------------------------------------------------- key/mouse
-    def on_keypress(self, event):
+    def update_status(self):
         if self.state is None:
             return
+        path = self.image_paths[self.index]
+        w_cm, h_cm = self.page_cm()
+        mode = "to'liq + blur fon" if self.blur_fit else "kesish"
+        orient = "yotiq" if self.orientation == "landscape" else "tik"
+        tail = f"   |   saqlangan: {self.saved_count}"
+        if self.skipped_count:
+            tail += f", o'tkazilgan: {self.skipped_count}"
+        self.status_var.set(
+            f"{self.index + 1}/{self.total} — {path.name}   |   "
+            f"{w_cm:g}x{h_cm:g} sm ({orient})   |   rejim: {mode}{tail}"
+        )
+
+    # ---------------------------------------------------- keybindings window
+    def toggle_help_window(self):
+        if self._help_window is not None and self._help_window.winfo_exists():
+            self.close_help_window()
+            return
+
+        win = tk.Toplevel(self.root)
+        self._help_window = win
+        win.title("Klavishlar")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.configure(bg="#111111")
+
+        tk.Label(
+            win, text="Klavishlar", fg="white", bg="#111111", font=("", 12, "bold"),
+        ).grid(row=0, column=0, columnspan=2, padx=16, pady=(14, 10), sticky="w")
+
+        for i, (keys, what) in enumerate(KEY_HELP, start=1):
+            tk.Label(
+                win, text=keys, fg=cfg.BOX_OUTLINE_COLOR, bg="#111111",
+                font=("Consolas", 10, "bold"), anchor="w",
+            ).grid(row=i, column=0, padx=(16, 14), pady=3, sticky="w")
+            tk.Label(
+                win, text=what, fg="#dddddd", bg="#111111", anchor="w",
+            ).grid(row=i, column=1, padx=(0, 16), pady=3, sticky="w")
+
+        tk.Label(
+            win, text="Yopish uchun: K", fg="#888888", bg="#111111",
+        ).grid(row=len(KEY_HELP) + 1, column=0, columnspan=2, padx=16, pady=(10, 14), sticky="w")
+
+        win.bind("<KeyPress>", self._help_keypress)
+        win.protocol("WM_DELETE_WINDOW", self.close_help_window)
+
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2 - win.winfo_width() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2 - win.winfo_height() // 2)
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def close_help_window(self):
+        if self._help_window is not None:
+            if self._help_window.winfo_exists():
+                self._help_window.destroy()
+            self._help_window = None
+        self.root.focus_force()
+
+    def _help_keypress(self, event):
+        """Keys pressed while the help window has focus still drive the editor."""
+        if event.keysym.lower() == "escape":
+            self.close_help_window()
+        else:
+            self.on_keypress(event)
+        return "break"
+
+    # ------------------------------------------------------------- key/mouse
+    def on_keypress(self, event):
         key = event.keysym.lower()
+        if key == "k":
+            self.toggle_help_window()
+            return
+        if self.state is None:
+            return
         if key in ("w", "up"):
             self._pan(0, -1)
         elif key in ("s", "down"):
@@ -240,16 +404,29 @@ class App:
             self.on_zoom(1 / cfg.ZOOM_FACTOR)
         elif key == "2":
             self.on_zoom(cfg.ZOOM_FACTOR)
+        elif key == "b":
+            self.toggle_blur_fit()
+        elif key == "p":
+            self.set_orientation("portrait")
+        elif key == "l":
+            self.set_orientation("landscape")
+        elif key in ("n", "delete"):
+            self.skip_current()
+        elif key == "r":
+            self.state.reset()
+            self.redraw()
         elif key in ("return", "space", "escape"):
             self.confirm_and_next()
 
     def _pan(self, dx, dy):
+        if self.blur_fit:  # nothing to pan: the whole photo is already on the page
+            return
         step = self.state.box_h * cfg.PAN_STEP_FRACTION
         self.state.pan(dx * step, dy * step)
         self.redraw()
 
     def on_zoom(self, factor):
-        if self.state is None:
+        if self.state is None or self.blur_fit:
             return
         self.state.zoom(factor)
         self.redraw()
@@ -263,12 +440,12 @@ class App:
             self.on_zoom(cfg.ZOOM_FACTOR)
 
     def on_drag_start(self, event):
-        if self.state is None:
+        if self.state is None or self.blur_fit:
             return
         self._drag_start = (event.x, event.y, self.state.cx, self.state.cy)
 
     def on_drag_move(self, event):
-        if self.state is None or self._drag_start is None or self.preview_scale <= 0:
+        if self.state is None or self.blur_fit or self._drag_start is None or self.preview_scale <= 0:
             return
         sx, sy, start_cx, start_cy = self._drag_start
         dx_img = (event.x - sx) / self.preview_scale
@@ -309,18 +486,49 @@ class App:
             self.display_source = img
 
         self.state = CropState(img.width, img.height, self.aspect_ratio)
-        self.status_var.set(f"{self.index + 1}/{self.total} — {path.name}  ({img.width}x{img.height}px)")
+        self._blur_preview = None
+        self.update_status()
         self.redraw()
+
+    def blur_preview_image(self):
+        """The composed blur-fit page, rendered small and cached until the page or photo changes."""
+        if self._blur_preview is None:
+            tw, th = self.target_px
+            scale = min(1.0, cfg.BLUR_PREVIEW_SIDE / max(tw, th))
+            size = (max(1, int(round(tw * scale))), max(1, int(round(th * scale))))
+            self._blur_preview = render.blur_fit(self.display_source, size)
+        return self._blur_preview
 
     def redraw(self):
         self.canvas.delete("all")
-        if self.current_pil is None:
+        if self.current_pil is None or self.state is None:
             return
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
         if cw < 10 or ch < 10:
             return
+        if self.blur_fit:
+            self.draw_blur_fit(cw, ch)
+        else:
+            self.draw_crop_box(cw, ch)
 
+    def draw_blur_fit(self, cw, ch):
+        """Show the finished page itself — what comes out of the printer."""
+        page = self.blur_preview_image()
+        scale = min(cw / page.width, ch / page.height) * 0.94
+        disp_w, disp_h = max(1, int(page.width * scale)), max(1, int(page.height * scale))
+        offset_x = (cw - disp_w) // 2
+        offset_y = (ch - disp_h) // 2
+        self.preview_scale = scale
+
+        self.tk_preview = ImageTk.PhotoImage(page.resize((disp_w, disp_h), Image.BILINEAR))
+        self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.tk_preview)
+        self.canvas.create_rectangle(
+            offset_x, offset_y, offset_x + disp_w, offset_y + disp_h,
+            outline=cfg.PAGE_OUTLINE_COLOR, width=2,
+        )
+
+    def draw_crop_box(self, cw, ch):
         img_w, img_h = self.current_pil.width, self.current_pil.height
         scale = min(cw / img_w, ch / img_h)
         disp_w, disp_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
@@ -356,7 +564,34 @@ class App:
             return
         if not self.export_current():
             return
+        self.saved_count += 1
         self.current_pil.close()
+        self.advance()
+
+    def skip_current(self):
+        """Set this photo aside in skipped-images/ and move on without printing it."""
+        if self.current_pil is None or self.state is None:
+            return
+        path = self.image_paths[self.index]
+        try:
+            self.skipped_dir.mkdir(parents=True, exist_ok=True)
+            dest = utils.unique_path(self.skipped_dir / path.name)
+            self.current_pil.close()  # let go of the file before touching it on disk
+            if cfg.SKIP_MOVE_ORIGINAL:
+                shutil.move(str(path), str(dest))
+            else:
+                shutil.copy2(path, dest)
+        except Exception as e:
+            messagebox.showerror(
+                "Xatolik",
+                f"'{path.name}' ni '{self.skipped_dir}/' papkasiga qo'yib bo'lmadi:\n{e}",
+            )
+            self.load_current_image()  # reopen it and stay on this photo
+            return
+        self.skipped_count += 1
+        self.advance()
+
+    def advance(self):
         self.index += 1
         if self.index >= len(self.image_paths):
             self.finish()
@@ -365,28 +600,33 @@ class App:
 
     def export_current(self):
         try:
-            x0, y0, x1, y1 = self.state.box_px()
-            x0, y0 = max(0, int(round(x0))), max(0, int(round(y0)))
-            x1 = min(self.current_pil.width, int(round(x1)))
-            y1 = min(self.current_pil.height, int(round(y1)))
-            cropped = self.current_pil.crop((x0, y0, x1, y1))
-            resized = cropped.resize(self.target_px, Image.LANCZOS)
-            out_path = self.output_dir / f"{self.index + 1}.png"
-            resized.save(out_path, dpi=(self.dpi, self.dpi))
+            if self.blur_fit:
+                page = render.blur_fit(self.current_pil, self.target_px)
+            else:
+                page = render.crop_fit(self.current_pil, self.state.box_px(), self.target_px)
+            out_path = self.output_dir / f"{self.saved_count + 1}.png"
+            page.save(out_path, dpi=(self.dpi, self.dpi))
             return True
         except Exception as e:
             messagebox.showerror("Xatolik", f"Rasmni saqlashda xatolik yuz berdi:\n{e}")
             return False
 
     def finish(self):
+        self.close_help_window()
         self.canvas.delete("all")
         self.current_pil = None
         self.state = None
+        w_cm, h_cm = self.page_cm()
         msg = (
-            f"Hammasi tayyor!\n{self.total} ta rasm '{self.output_dir}/' papkasiga "
-            f"{self.target_px[0]}x{self.target_px[1]}px ({self.layout_w_cm:g}x{self.layout_h_cm:g} sm, "
+            f"Hammasi tayyor!\n{self.saved_count} ta rasm '{self.output_dir}/' papkasiga "
+            f"{self.target_px[0]}x{self.target_px[1]}px ({w_cm:g}x{h_cm:g} sm, "
             f"{self.dpi} DPI) o'lchamda saqlandi."
         )
+        if self.skipped_count:
+            msg += (
+                f"\n{self.skipped_count} ta rasm o'tkazib yuborildi — "
+                f"'{self.skipped_dir}/' papkasida."
+            )
         self.status_var.set("Tayyor!")
         messagebox.showinfo("Tayyor", msg)
         self.root.destroy()
